@@ -37,12 +37,15 @@ class ProviderConfig:
 
     @staticmethod
     def from_env() -> "ProviderConfig":
+        # Accept both LLM_PROVIDER and PROVIDER for convenience
+        provider_val = os.environ.get("LLM_PROVIDER") or os.environ.get("PROVIDER") or "openai"
+        base_url = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
         return ProviderConfig(
-            provider=os.environ.get("LLM_PROVIDER", "openai").lower(),
+            provider=str(provider_val).lower(),
             model=os.environ.get("LLM_MODEL"),
             openai_api_key=os.environ.get("OPENAI_API_KEY"),
             gemini_api_key=os.environ.get("GEMINI_API_KEY"),
-            ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+            ollama_base_url=base_url,
         )
 
 
@@ -144,7 +147,6 @@ class OllamaClient(LLMClient):
                 model=use_model,
                 messages=[{"role": m["role"], "content": m["content"]} for m in messages],
                 options={"temperature": 0.7},
-                keep_alive=True,
             )
             return res
 

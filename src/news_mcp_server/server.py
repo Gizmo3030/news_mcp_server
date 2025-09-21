@@ -20,24 +20,71 @@ server = Server("news-mcp-server")
 
 
 def _tool(name: str, description: str, args_schema: dict) -> Tool:
-    # Build a valid JSON Schema object: per-property 'required' is not valid; it must be a top-level array.
-    required_keys = [k for k, v in args_schema.items() if isinstance(v, dict) and v.get("required")]
-    # Remove the boolean 'required' marker from each property schema
-    properties: dict = {}
-    for key, schema in args_schema.items():
-        if isinstance(schema, dict) and "required" in schema:
-            schema = {k: v for k, v in schema.items() if k != "required"}
-        properties[key] = schema
+    """Build a JSON Schema for a tool input.
 
-    input_schema: dict = {"type": "object", "properties": properties}
+    Some sources mistakenly place a boolean `required: true/false` on each property.
+    JSON Schema requires `required` to be an array on the enclosing object. We
+    recursively normalize this so downstream generators (like HTTP proxies) don't
+    encounter unsupported boolean types where a schema is expected.
+    """
+
+    def _clean_properties(props: Dict[str, Any]) -> tuple[Dict[str, Any], List[str]]:
+        top_required: List[str] = []
+        cleaned: Dict[str, Any] = {}
+        for key, schema in props.items():
+            if not isinstance(schema, dict):
+                cleaned[key] = schema
+                continue
+
+            # Collect and strip boolean per-property required
+            if isinstance(schema.get("required"), bool) and schema.get("required"):
+                top_required.append(key)
+            if "required" in schema and isinstance(schema.get("required"), bool):
+                schema = {k: v for k, v in schema.items() if k != "required"}
+
+            # Recurse into object schemas
+            if schema.get("type") == "object":
+                nested_props = schema.get("properties", {}) or {}
+                nested_clean, nested_required = _clean_properties(nested_props)
+                schema = {**schema, "properties": nested_clean}
+                existing_req = schema.get("required")
+                if not isinstance(existing_req, list):
+                    existing_req = []
+                combined = list(dict.fromkeys([*existing_req, *nested_required]))
+                if combined:
+                    schema["required"] = combined
+
+            # Recurse into array item object schemas
+            if schema.get("type") == "array":
+                items = schema.get("items")
+                if isinstance(items, dict) and items.get("type") == "object":
+                    nested_props = items.get("properties", {}) or {}
+                    nested_clean, nested_required = _clean_properties(nested_props)
+                    items = {**items, "properties": nested_clean}
+                    existing_req = items.get("required")
+                    if not isinstance(existing_req, list):
+                        existing_req = []
+                    combined = list(dict.fromkeys([*existing_req, *nested_required]))
+                    if combined:
+                        items["required"] = combined
+                    schema = {**schema, "items": items}
+
+            cleaned[key] = schema
+
+        return cleaned, top_required
+
+    properties, required_keys = _clean_properties(args_schema)
+
+    input_schema: dict = {
+        "type": "object",
+        "properties": properties,
+        # Being explicit helps some generators and avoids accidental extra keys.
+        "additionalProperties": False,
+    }
     if required_keys:
         input_schema["required"] = required_keys
 
-    return Tool(
-        name=name,
-        description=description,
-        inputSchema=input_schema,
-    )
+    return Tool(name=name, description=description, inputSchema=input_schema)
 
 
 @server.list_tools()
@@ -94,9 +141,12 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
         model = arguments.get("model")
         cfg = ProviderConfig.from_env()
         if provider_name:
-            cfg.provider = provider_name  # type: ignore
+            # Be tolerant of case
+            cfg.provider = str(provider_name).lower()  # type: ignore
         if model:
             cfg.model = model
+        # Small debug hint to stderr to aid diagnostics when run standalone
+        print(f"discuss: using provider={cfg.provider}, model={cfg.model or '(default)'}", file=sys.stderr)
         client = make_client(cfg)
         resp = await client.chat(messages)  # type: ignore[arg-type]
         return [TextContent(type="text", text=resp.content)]
